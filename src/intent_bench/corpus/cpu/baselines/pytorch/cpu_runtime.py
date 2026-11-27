@@ -471,11 +471,14 @@ def row_boolean_reduction(shape_source):
 
 
 def kmeans_assign(points, centroids):
-    distances = (points.float().square().sum(dim=1, keepdim=True)
-                 + centroids.float().square().sum(dim=1)[None, :]
-                 - 2.0 * points.float() @ centroids.float().T)
+    # Keep the discrete argmin stable for nearly equidistant f16 points.
+    # The norm/dot identity remains independent of the kernel's sum of squares.
+    points, centroids = points.double(), centroids.double()
+    distances = (points.square().sum(dim=1, keepdim=True)
+                 + centroids.square().sum(dim=1)[None, :]
+                 - 2.0 * points @ centroids.T)
     minimum, assignment = distances.min(dim=1)
-    return assignment.to(torch.int32), minimum
+    return assignment.to(torch.int32), minimum.float()
 
 
 def scalar_table_lookup(labels, table):

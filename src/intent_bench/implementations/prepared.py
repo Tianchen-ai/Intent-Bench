@@ -27,14 +27,17 @@ def native_samples(measure):
 
 def native_selection(call, kernel):
     """Expose V1 public observations, retaining missing provider timings as null."""
-    import hashlib
-    from pathlib import Path
+    from intent import PreparedSequence
+    if isinstance(call, PreparedSequence):
+        return {"members": [_selection(observed) for observed in call.observations]}
     observed = getattr(call, "observation", None)
-    sources = [Path(a.cache_directory) / "kernel.source" for a in kernel.artifacts]
+    return _selection(observed)
+
+
+def _selection(observed):
     return dict(
         winner_configuration=dict(observed.configuration) if observed and observed.configuration else None,
         artifact_format="emitted-source",
-        source_sha256=[hashlib.sha256(p.read_bytes()).hexdigest() for p in sources if p.is_file()],
         trials_us=[dict(configuration=dict(c.configuration or ()), status=c.status,
                         us=None if c.elapsed_ms is None else 1000*c.elapsed_ms)
                    for c in observed.candidates] if observed else [],

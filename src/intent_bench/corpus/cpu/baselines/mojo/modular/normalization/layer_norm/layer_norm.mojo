@@ -1,12 +1,12 @@
 # Same-moments LayerNorm through MAX rowwise library operations, not its Welford entry.
 from algorithm import rowwise
-from algorithm.reduce_op import ReduceSum
+from builtin_kernels.monoids import ReduceSum
+from algorithm.rowwise_types import RowCoord
 from layout import Coord
 from max.gpu.host import DeviceContext
 from std.math import rsqrt
 from std.os import abort
 from std.runtime import initialize_runtime
-from std.utils.index import IndexList
 
 
 @export("max_layer_norm_moments")
@@ -31,10 +31,10 @@ def max_layer_norm_moments(
         comptime rank = row_coords.rank
 
         @always_inline
-        def load[w: Int, alignment: Int, coord_rank: Int](index: IndexList[coord_rank]) {
+        def load[w: Int, alignment: Int](index: RowCoord[rank]) {
             var x, var x_s0
         } -> SIMD[DType.float32, w]:
-            var offset = Int(index[0]) * Int(x_s0) + Int(index[1])
+            var offset = Int(index.coord[0].value()) * Int(x_s0) + Int(index.coord[1].value())
             return x.unsafe_offset(offset).unsafe_load[width=w]()
 
         var row = rowwise.Row[params, DType.float32, DType.float32, 1, rank, is_cached=True](
@@ -42,11 +42,11 @@ def max_layer_norm_moments(
         )
 
         @always_inline
-        def identity[w: Int](value: SIMD[DType.float32, w], index: IndexList[rank]) {} -> SIMD[DType.float32, w]:
+        def identity[w: Int](value: SIMD[DType.float32, w], index: RowCoord[rank]) {} -> SIMD[DType.float32, w]:
             return value
 
         @always_inline
-        def square[w: Int](value: SIMD[DType.float32, w], index: IndexList[rank]) {} -> SIMD[DType.float32, w]:
+        def square[w: Int](value: SIMD[DType.float32, w], index: RowCoord[rank]) {} -> SIMD[DType.float32, w]:
             return value * value
 
         var sum_x = row.reduce[ReduceSum[DType.float32, params.simd_width]](identity, load).acc[0]
@@ -56,14 +56,14 @@ def max_layer_norm_moments(
         var inverse_std = rsqrt(variance + epsilon)
 
         @always_inline
-        def write[w: Int](value: SIMD[DType.float32, w], index: IndexList[rank]) {
+        def write[w: Int](value: SIMD[DType.float32, w], index: RowCoord[rank]) {
             var mean, var inverse_std, var weight, var bias, var output, var y_s0
         }:
-            var column = Int(index[1])
+            var column = Int(index.coord[1].value())
             var gamma = weight.unsafe_offset(column).unsafe_load[width=w]()
             var beta = bias.unsafe_offset(column).unsafe_load[width=w]()
             var normalized = (value - SIMD[DType.float32, w](mean)) * SIMD[DType.float32, w](inverse_std)
-            var offset = Int(index[0]) * Int(y_s0) + column
+            var offset = Int(index.coord[0].value()) * Int(y_s0) + column
             output.unsafe_offset(offset).unsafe_store(normalized * gamma + beta)
 
         row.elementwise(write, load)

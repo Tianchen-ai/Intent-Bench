@@ -3,6 +3,8 @@ from intent_bench.corpus.cpu.baselines.mojo.source import prepare_source, scalar
 
 
 def prepare(target, x, weight, inverse_features, epsilon):
+    if epsilon != 1.0e-6:
+        raise NotImplementedError("MAX RMSNorm adapter specializes epsilon=1e-6")
     if inverse_features != 1.0 / x.shape[-1]:
         raise NotImplementedError("MAX RMSNorm uses the reciprocal of the normalized extent")
     return prepare_source(Path(__file__).with_name("rms_norm.mojo"), "max_rms_norm",

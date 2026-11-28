@@ -1,6 +1,6 @@
 # Native ABI adapter for the installed Modular/MAX CPU Softmax library.
 from layout import Coord, TileTensor, row_major
-from nn.softmax import softmax
+from nn.softmax import softmax_inline
 from std.os import abort
 from std.runtime import initialize_runtime
 from std.sys.info import simd_width_of
@@ -14,11 +14,11 @@ def max_softmax(
 ) abi("C"):
     initialize_runtime()
     var shape = Coord(Int(x_d0), Int(x_d1))
-    var input_tile = TileTensor(x, row_major(shape)).as_immut()
+    var input_tile = TileTensor(x, row_major(shape)).as_imm()
     var result = TileTensor(output, row_major(Coord(Int(y_d0), Int(y_d1))))
     comptime width = simd_width_of[DType.float32]()
 
     try:
-        softmax[DType.float32, width, 2](input_tile, result, 1)
+        softmax_inline[DType.float32, width, 2](input_tile, result, 1)
     except error:
         abort(String("MAX Softmax failed: ", error))

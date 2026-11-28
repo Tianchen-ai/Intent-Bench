@@ -12,13 +12,14 @@ def run_suite(args,environment,measurement,implementations,*,oracle_environment=
     if args.jobs != 1:
         raise ValueError("suite requests use serial device ownership; --jobs must be 1")
     providers = SUITES[args.suite]
+    expected = {"intent:" + p for p in providers} | {"intent-v2:" + p for p in providers}
     selected = [entry.metadata for entry in workloads().values()
-                if any("intent:"+p in entry.metadata["implementations"] for p in providers)]
+                if any(impl in expected for impl in entry.metadata["implementations"])]
     root = destination(environment,"suites/"+args.suite,args.output)
     rows = []
     for index,item in enumerate(selected):
         participants = implementations or tuple(name for name in item["implementations"]
-                                                if name in {"intent:"+p for p in providers})
+                                                if name in expected)
         outcome = run(RunRequest(item["name"],participants,environment,measurement,args.baseline,
             tuple(args.case or ()),{},args.seed,root/"cases"/item["name"],timeout=args.timeout,
             oracle_environment=oracle_environment))

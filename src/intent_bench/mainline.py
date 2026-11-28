@@ -8,9 +8,13 @@ from .implementations.intent import backend_options, execution, compile_options
 def check_program(request):
     env = request.environment
     intent_environment(env)
-    from intent.examples import PROGRAMS, load_program
-    from intent.examples.programs.common import ExampleContext
-    from intent.examples.programs import inputs
+    try:
+        from intent.examples import PROGRAMS, load_program
+        from intent.examples.programs.common import ExampleContext
+        from intent.examples.programs import inputs
+    except ImportError:
+        from intentdsl.programs import PROGRAMS, load_program, inputs
+        ExampleContext = None
     if len(request.implementations) != 1 or not request.implementations[0].startswith("intent:"):
         raise ValueError("a program check requires one explicit Intent backend")
     backend = request.implementations[0].partition(":")[2]

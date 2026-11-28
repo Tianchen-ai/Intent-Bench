@@ -1,7 +1,10 @@
 """Prepared ATen CPU calls through libtorch, timed without Python submission."""
 import ctypes as C
 from functools import cache
+import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -21,49 +24,89 @@ OPERATIONS = {name: index for index, name in enumerate((
 
 
 @cache
+def _supports_march_native(compiler):
+    return subprocess.run(
+        [compiler, "-march=native", "-E", "-x", "c++", "-", "-o", os.devnull],
+        input="", text=True, capture_output=True, timeout=30,
+    ).returncode == 0
+
+
+@cache
 def library(root, compiler, onednn=False, dnnl_prefix=None, *, aoti=False, vllm=False):
     import torch
     from torch.utils.cpp_extension import include_paths, library_paths
     parent = root/"build/native"
     parent.mkdir(parents=True, exist_ok=True)
-    build = Path(tempfile.mkdtemp(prefix="aten-cpu-", dir=parent))
+    variant = "-".join(("aten-cpu", *(tag for tag, enabled in (("onednn", onednn), ("aoti", aoti), ("vllm", vllm)) if enabled)))
+    cached = parent/variant
     source = Path(__file__).parents[1]/"native/aten_cpu.cpp"
-    command = [compiler, "-std=c++17", "-O3", "-shared", "-fPIC",
-               "-D_GLIBCXX_USE_CXX11_ABI="+str(int(torch.compiled_with_cxx11_abi())), str(source),
-               "-o", str(build/"aten.so")]
-    command += ["-I"+path for path in include_paths()]
+    sources = [source]
+    head = [compiler, "-std=c++20", "-O3", "-shared", "-fPIC",
+            "-D_GLIBCXX_USE_CXX11_ABI="+str(int(torch.compiled_with_cxx11_abi())), str(source)]
+    head += ["-I"+path for path in include_paths()]
     if aoti:
-        command += ["-DINTENT_BENCH_AOTI"]
+        head += ["-DINTENT_BENCH_AOTI"]
     if vllm:
-        command += ["-DINTENT_BENCH_VLLM", "-fopenmp", "-march=native", str(source.with_name("vllm_moe.cpp"))]
+        vllm_source = source.with_name("vllm_moe.cpp")
+        sources.append(vllm_source)
+        head += ["-DINTENT_BENCH_VLLM", "-fopenmp"]
+        if _supports_march_native(compiler):
+            head += ["-march=native"]
+        head += [str(vllm_source)]
         capability = torch.backends.cpu.get_cpu_capability()
         if capability in {"AVX2", "AVX512"}:
-            command += ["-DCPU_CAPABILITY_"+capability]
-    command += [option for path in library_paths() for option in ("-L"+path, "-Wl,-rpath,"+path)]
-    command += ["-ltorch_cpu", "-lc10"]
+            head += ["-DCPU_CAPABILITY_"+capability]
     if onednn:
-        # Compile against the system oneDNN headers separately from libtorch's
-        # bundled private headers. The bridge exposes only its own plain C ABI.
-        matrix_source=source.with_name("onednn_matmul.cpp")
-        matrix_object=build/"onednn_matmul.o"
-        include=["-I"+str(Path(dnnl_prefix)/"include")] if dnnl_prefix else []
-        result=subprocess.run([compiler,"-std=c++17","-O3","-fPIC",*include,"-c",str(matrix_source),
-                               "-o",str(matrix_object)],text=True,capture_output=True,timeout=180)
-        (build/"onednn-compile.log").write_text(result.stdout+result.stderr)
+        sources.append(source.with_name("onednn_matmul.cpp"))
+    tail = [option for path in library_paths() for option in ("-L"+path, "-Wl,-rpath,"+path)]
+    tail += ["-ltorch_cpu", "-lc10"]
+    spec = {"head": head, "tail": tail, "dnnl_prefix": str(dnnl_prefix) if dnnl_prefix else None}
+    so_file = cached/"aten.so"
+    meta_file = cached/"command.json"
+    build = None
+    if so_file.is_file() and meta_file.is_file():
+        try:
+            saved = json.loads(meta_file.read_text())
+            so_mtime = so_file.stat().st_mtime_ns
+            if saved == spec and all(src.stat().st_mtime_ns <= so_mtime for src in sources):
+                build = cached
+        except (OSError, ValueError):
+            build = None
+    if build is None:
+        tmp = Path(tempfile.mkdtemp(prefix=variant+"-", dir=parent))
+        build_head = list(head)
+        build_tail = list(tail)
+        if onednn:
+            # Compile against the system oneDNN headers separately from libtorch's
+            # bundled private headers. The bridge exposes only its own plain C ABI.
+            matrix_source = source.with_name("onednn_matmul.cpp")
+            matrix_object = tmp/"onednn_matmul.o"
+            include = ["-I"+str(Path(dnnl_prefix)/"include")] if dnnl_prefix else []
+            result = subprocess.run([compiler, "-std=c++17", "-O3", "-fPIC", *include, "-c", str(matrix_source),
+                                     "-o", str(matrix_object)], text=True, capture_output=True, timeout=600)
+            (tmp/"onednn-compile.log").write_text(result.stdout+result.stderr)
+            if result.returncode:
+                from ..corpus._common.measurement import PipelineStageError
+                raise PipelineStageError("source_native_compilation",
+                    f"oneDNN 3.x development headers are required (environment option dnnl_prefix); "
+                    f"see {tmp/'onednn-compile.log'}\n{result.stderr}")
+            if dnnl_prefix:
+                directory = str(Path(dnnl_prefix)/"lib")
+                build_tail = ["-L"+directory, "-Wl,-rpath,"+directory] + build_tail
+            build_head += ["-DINTENT_BENCH_ONEDNN", str(matrix_object)]
+            build_tail += ["-ldnnl"]
+        command = [*build_head, "-o", str(tmp/"aten.so"), *build_tail]
+        result = subprocess.run(command, text=True, capture_output=True, timeout=600)
+        (tmp/"compile.log").write_text(result.stdout+result.stderr)
         if result.returncode:
             from ..corpus._common.measurement import PipelineStageError
-            raise PipelineStageError("source_native_compilation",
-                f"oneDNN 3.x development headers are required (environment option dnnl_prefix); "
-                f"see {build/'onednn-compile.log'}\n{result.stderr}")
-        if dnnl_prefix:
-            directory=str(Path(dnnl_prefix)/"lib")
-            command += ["-L"+directory,"-Wl,-rpath,"+directory]
-        command += ["-DINTENT_BENCH_ONEDNN",str(matrix_object),"-ldnnl"]
-    result = subprocess.run(command, text=True, capture_output=True, timeout=180)
-    (build/"compile.log").write_text(result.stdout+result.stderr)
-    if result.returncode:
-        from ..corpus._common.measurement import PipelineStageError
-        raise PipelineStageError("source_native_compilation", f"ATen binding build failed: {build/'compile.log'}\n{result.stderr}")
+            raise PipelineStageError("source_native_compilation", f"ATen binding build failed: {tmp/'compile.log'}\n{result.stderr}")
+        (tmp/"command.json").write_text(json.dumps(spec))
+        cached.mkdir(parents=True, exist_ok=True)
+        for fname in ("compile.log", "aten.so", "command.json"):
+            os.replace(tmp/fname, cached/fname)
+        shutil.rmtree(tmp, ignore_errors=True)
+        build = cached
     native = C.CDLL(str(build/"aten.so"))
     native.bench_aten_create.argtypes = [C.c_int, C.c_int, C.c_int, C.POINTER(C.c_void_p),
         C.POINTER(C.c_int), C.POINTER(C.c_int64), C.POINTER(C.c_int64), C.POINTER(C.c_int64),
@@ -260,13 +303,16 @@ def prepare(name, arguments, environment, *, package=None):
         if not timers:
             timers.append(NativeSequence((call,)))
         timer = timers[0]
-        def interval():
-            elapsed = timer.run()
+        def interval(repeat=1):
+            elapsed = timer.run(repeat)
             # C++ exceptions are retained across the C ABI. Surface them after
             # every interval, including the final sample, outside its timing.
             checked()
             return elapsed
-        return sample_timer(SimpleNamespace(run=interval), settings,
-                            prepared.reset or (lambda: None), metadata=metadata)
+        wrapped = SimpleNamespace(run=interval, supports_repeat=True, _calibrated_repeat=timer._calibrated_repeat)
+        try:
+            return sample_timer(wrapped, settings, prepared.reset, metadata=metadata)
+        finally:
+            timer._calibrated_repeat = wrapped._calibrated_repeat
     prepared.native_measure = measure
     return prepared

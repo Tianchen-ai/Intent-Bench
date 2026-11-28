@@ -18,6 +18,12 @@ def inputs(case, seed):
 
 
 def tensors(data, device):
+    from importlib.util import find_spec
+
+    if device == "cpu" and find_spec("torch") is None:
+        return tuple(
+            np.ascontiguousarray(x) if isinstance(x, np.ndarray) else x for x in data
+        )
     import torch
 
     return tuple(

@@ -46,6 +46,8 @@ def catalog():
             row['implementations']=['weft','intent:weft']
             if row["kernel"]=="q4_k_projection":
                 row["implementations"].extend("intent-v2:"+b for b in ("triton","cutile","mojo","weft","bangc"))
+            else:
+                row["implementations"].append("intent-v2:weft")
             row['source_runtime']='implementations/triton_weft_source.py'
         elif provider=='bangc':
             source='cnnl' if row['kernel'] in {'relu','fused_softmax','dense_gemm'} else 'reference:mojo' if row['kernel'] in {'causal_attention_f32','causal_linear_attention_f32'} else 'reference:cuda'

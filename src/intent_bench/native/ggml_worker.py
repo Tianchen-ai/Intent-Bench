@@ -9,6 +9,7 @@ from cnnl_worker import serve
 
 class Worker:
     def __init__(self,request):
+        self._repeat=None
         root=Path(__file__).parent;source=Path(request["source"]);libraries=Path(request["libraries"])
         start=time.perf_counter()
         build=subprocess.run([request.get("cxx","c++"),"-O3","-std=c++17","-shared","-fPIC",str(root/"ggml_ops.cpp"),
@@ -125,13 +126,32 @@ class Worker:
         return {'items':[record(weights),record(activation)]}
 
     def measure(self,samples,warmup,cache):
-        for _ in range(warmup):self.run()
+        min_ms=0.05
+        max_repeat=65536
+        repeat=self._repeat or 1
+        for _ in range(warmup):
+            if self.lib.bench_measure(self.context,repeat)<0:raise RuntimeError(self.lib.bench_error().decode())
         eviction=np.empty(64*1024*1024,dtype=np.uint8) if cache=='flush' else None
         values=[]
         for _ in range(samples):
-            if eviction is not None:eviction.fill(0)
-            elapsed=self.lib.bench_measure(self.context,1)
-            if elapsed<=0:raise RuntimeError(self.lib.bench_error().decode())
+            if self._repeat is None:
+                while True:
+                    if eviction is not None:eviction.fill(0)
+                    elapsed=self.lib.bench_measure(self.context,repeat)
+                    if elapsed<0:raise RuntimeError(self.lib.bench_error().decode())
+                    if elapsed>0 and elapsed*repeat>=min_ms:
+                        self._repeat=repeat
+                        break
+                    if repeat>=max_repeat:
+                        if elapsed<=0:raise RuntimeError('ggml timer returned non-positive duration')
+                        self._repeat=repeat
+                        break
+                    repeat=min(max_repeat,repeat*2 if elapsed<=0 else max(repeat*2,int(min_ms/elapsed)+1))
+            else:
+                if eviction is not None:eviction.fill(0)
+                elapsed=self.lib.bench_measure(self.context,repeat)
+                if elapsed<0:raise RuntimeError(self.lib.bench_error().decode())
+                if elapsed<=0:raise RuntimeError('ggml timer returned non-positive duration')
             values.append(elapsed)
         return values
 

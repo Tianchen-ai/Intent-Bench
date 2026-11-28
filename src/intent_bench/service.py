@@ -33,6 +33,12 @@ def execute_local(request):
             if request.environment.cpus is not None:
                 import os
                 selected = set(request.environment.cpus)
+                if selected and not selected.issubset(os.sched_getaffinity(0)):
+                    try:
+                        from weft_core.cpu import bind_cpus
+                        bind_cpus(sorted(selected))
+                    except Exception:
+                        pass
                 if not selected or not selected.issubset(os.sched_getaffinity(0)):
                     raise ValueError("requested CPUs must be a nonempty subset of this worker's allowed CPU set")
                 os.sched_setaffinity(0, selected)

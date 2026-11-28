@@ -69,9 +69,36 @@ def registrations():
     }
 
 
-def _resolve_device(env, impl):
+def _has_torch() -> bool:
+    from importlib.util import find_spec
+
+    return find_spec("torch") is not None
+
+
+def _wrap_array(arr: np.ndarray):
+    arr = np.ascontiguousarray(arr)
+    if _has_torch():
+        import torch
+
+        return torch.from_numpy(arr)
+    return arr
+
+
+def _to_torch_data(data):
     import torch
 
+    def conv(x):
+        if not isinstance(x, np.ndarray):
+            return x
+        c = np.ascontiguousarray(x)
+        if c.dtype.name == "bfloat16":
+            return torch.from_numpy(c.view(np.uint16)).view(torch.bfloat16).clone()
+        return torch.from_numpy(c)
+
+    return tuple(conv(v) for v in data)
+
+
+def _resolve_device(env, impl):
     if impl in {"aten:cpu", "ggml", "intent-v2:mojo", "intent-v2:weft"}:
         if env.device not in {"auto", "cpu"}:
             raise EnvironmentUnavailable(f"{impl} requires a CPU environment")
@@ -87,6 +114,8 @@ def _resolve_device(env, impl):
             raise EnvironmentUnavailable(f"{impl} requires a CUDA environment")
         return device
     if env.device == "auto":
+        import torch
+
         return "cuda:0" if torch.cuda.is_available() else "cpu"
     if impl == "inductor" and env.device.startswith("mlu:"):
         raise EnvironmentUnavailable("inductor requires a CPU or CUDA environment")
@@ -94,6 +123,10 @@ def _resolve_device(env, impl):
 
 
 def _transfer(args, device):
+    if device == "cpu" and not _has_torch():
+        return tuple(
+            np.ascontiguousarray(x) if isinstance(x, np.ndarray) else x for x in args
+        )
     import torch
 
     if device.startswith("mlu:"):
@@ -142,13 +175,12 @@ def _prepare_v2(name, backend, args, env, device):
         from ..implementations.native_sequence import NativeSequence
 
         timer = None
-        noop = lambda: None
 
         def measure(settings):
             nonlocal timer
             if timer is None:
                 timer = NativeSequence((call,))
-            return sample_timer(timer, settings, noop, metadata=metadata)
+            return sample_timer(timer, settings, None, metadata=metadata)
 
         prepared.native_measure = measure
         prepared.close = lambda: timer and timer.close()
@@ -167,8 +199,6 @@ def _prepare_v2(name, backend, args, env, device):
 
 
 def _inputs(name, case, seed):
-    import torch
-
     p = case.parameters
     rng = np.random.default_rng(seed)
 
@@ -182,7 +212,7 @@ def _inputs(name, case, seed):
         d_f16 = rng.uniform(0.002, 0.01, size=(n, g)).astype("<f2")
         records[:, :, 208:210] = d_f16.view(np.uint8).reshape(n, g, 2)
         x = rng.uniform(-1.0, 1.0, size=(g, 256)).astype(np.float32)
-        return (torch.from_numpy(records), torch.from_numpy(x))
+        return (_wrap_array(records), _wrap_array(x))
 
     if name == "mxfp4_gemm":
         m, n, k = p["m"], p["n"], p["k"]
@@ -193,10 +223,10 @@ def _inputs(name, case, seed):
         sa = rng.integers(123, 130, size=(m, g), dtype=np.uint8)
         sb = rng.integers(123, 130, size=(g, n), dtype=np.uint8)
         return (
-            torch.from_numpy(a),
-            torch.from_numpy(sa),
-            torch.from_numpy(b),
-            torch.from_numpy(sb),
+            _wrap_array(a),
+            _wrap_array(sa),
+            _wrap_array(b),
+            _wrap_array(sb),
         )
 
     if name == "awq_int4_gemm":
@@ -213,10 +243,10 @@ def _inputs(name, case, seed):
             qz |= z_u4[:, :, lane] << np.uint32(sh)
         scales = rng.uniform(0.005, 0.03, size=(g, n)).astype(np.float16)
         return (
-            torch.from_numpy(x),
-            torch.from_numpy(qw.view(np.int32)),
-            torch.from_numpy(scales),
-            torch.from_numpy(qz.view(np.int32)),
+            _wrap_array(x),
+            _wrap_array(qw.view(np.int32)),
+            _wrap_array(scales),
+            _wrap_array(qz.view(np.int32)),
         )
 
     if name == "depthwise_conv2d":
@@ -225,16 +255,16 @@ def _inputs(name, case, seed):
         weight = rng.standard_normal((c, 3, 3), dtype=np.float32) * 0.3
         bias = rng.standard_normal((c,), dtype=np.float32) * 0.1
         return (
-            torch.from_numpy(x),
-            torch.from_numpy(weight),
-            torch.from_numpy(bias),
+            _wrap_array(x),
+            _wrap_array(weight),
+            _wrap_array(bias),
         )
 
     if name == "gemm_nt":
         m, n, k = p["m"], p["n"], p["k"]
         lhs = (rng.standard_normal((m, k), dtype=np.float32) * 0.25).astype(np.float16)
         rhs = (rng.standard_normal((n, k), dtype=np.float32) * 0.25).astype(np.float16)
-        return (torch.from_numpy(lhs), torch.from_numpy(rhs))
+        return (_wrap_array(lhs), _wrap_array(rhs))
 
     raise KeyError(name)
 
@@ -287,6 +317,8 @@ def _e8m0_to_f64(exp_u8: np.ndarray) -> np.ndarray:
 
 def _oracle(name, case, data):
     import torch
+
+    data = _to_torch_data(data)
 
     if name == "q6k_gemv":
         from ..references.quantization import q8_fields
@@ -361,23 +393,30 @@ def _oracle(name, case, data):
 
 
 def _prepare_baseline(name, impl, case, data, env, device):
-    import torch
-    import torch.nn.functional as F
-
     if impl == "ggml" and name == "q6k_gemv":
         from ..implementations.native_libraries import ggml
 
         records, x = data
         g, blk = x.shape
+        records_np = records if isinstance(records, np.ndarray) else records.numpy()
+        x_np = x if isinstance(x, np.ndarray) else x.numpy()
         packed = ggml(
             "q6_projection_packed",
             case,
-            (records.numpy(), x.numpy().reshape(1, g * blk)),
+            (records_np, x_np.reshape(1, g * blk)),
             env,
         )
         orig_result = packed.result
-        packed.result = lambda: torch.from_numpy(orig_result()).reshape(-1)
+        if _has_torch():
+            import torch
+
+            packed.result = lambda: torch.from_numpy(orig_result()).reshape(-1)
+        else:
+            packed.result = lambda: orig_result().reshape(-1)
         return packed
+
+    import torch
+    import torch.nn.functional as F
 
     args = _transfer(data, device)
     state: dict[str, object] = {}

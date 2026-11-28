@@ -75,7 +75,10 @@ def write_tree(value, directory):
                 dtype=str(item.dtype).removeprefix("torch."), shape=tuple(item.shape),
                 strides=tuple(s * item.element_size() for s in item.stride()),
                 offset=item.storage_offset() * item.element_size())
-        elif (module := sys.modules.get("intent.examples.programs.inputs")) is not None and isinstance(item, module.Array):
+        elif (
+            ((module := sys.modules.get("intentdsl.programs.inputs")) is not None and isinstance(item, module.Array))
+            or ((module := sys.modules.get("intent.examples.programs.inputs")) is not None and isinstance(item, module.Array))
+        ):
             if item.data is None:
                 raise ValueError("oracle transport requires actual array contents")
             result.update(kind="intent_array", dtype=item.dtype, data=encode(item.data))
@@ -133,7 +136,10 @@ def read_tree(directory, *, tensor_device="cpu", host_arrays=False):
                 result = tensors[key].view(dtype).as_strided(tuple(item["shape"]),
                     tuple(s // width for s in item["strides"]), item["offset"] // width)
         elif kind == "intent_array":
-            from intent.examples.programs.inputs import Array
+            try:
+                from intentdsl.programs.inputs import Array
+            except ImportError:
+                from intent.examples.programs.inputs import Array
             data = decode(item["data"])
             result = Array(data, item["dtype"], data.shape)
         elif kind in {"list", "tuple"}:

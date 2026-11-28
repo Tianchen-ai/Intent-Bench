@@ -93,24 +93,29 @@ def build(row):
         probabilities=np.exp(scores-scores.max(-1,keepdims=True))
         return probabilities/probabilities.sum(-1,keepdims=True)@v
     implementations={'weft':Implementation('weft',source),'intent:weft':Implementation('intent:weft',generated)}
+    from functools import partial
+    from ..implementations.v2_program import bind
+    from .programs import _device
+    v2_symbol = ("q4_projection" if projection else
+                 "int8_gemm" if matrix else
+                 "causal_linear_attention" if linear else
+                 "causal_attention_f32")
+    def weft_v2_call(backend,case,args,env):
+        device=_device(env,backend)
+        if device=="cpu":
+            check_execution(env,ime)
+        else:
+            import torch
+            if device.startswith("mlu"):import torch_mlu
+            args=tuple(torch.from_numpy(v).to(device) if isinstance(v,np.ndarray) else v for v in args)
+        return bind(v2_symbol,backend,args,env,device)
     if projection and not ime:
-        from functools import partial
-        from ..implementations.v2_program import bind
-        from .programs import _device
-        def projection_call(backend,case,args,env):
-            device=_device(env,backend)
-            if device=="cpu":
-                check_execution(env,False)
-            else:
-                import torch
-                if device.startswith("mlu"):import torch_mlu
-                args=tuple(torch.from_numpy(v).to(device) for v in args)
-            return bind("q4_projection",backend,args,env,device)
         from ..references.aten_rows import registrations
         implementations.update(registrations(row["name"]))
-        for backend in ("triton","cutile","mojo","weft","bangc"):
-            key="intent-v2:"+backend
-            implementations[key]=Implementation(key,partial(projection_call,backend))
+    v2_backends = ("triton","cutile","mojo","weft","bangc") if (projection and not ime) else ("weft",)
+    for backend in v2_backends:
+        key="intent-v2:"+backend
+        implementations[key]=Implementation(key,partial(weft_v2_call,backend))
     return Workload(row['name'],[Case(row['case'],{'profile':'original'})],inputs,
         implementations,oracle=oracle,
         atol=0 if matrix else 1e-4 if projection else 2e-4,rtol=0 if matrix else 2e-3 if projection else 1e-5,

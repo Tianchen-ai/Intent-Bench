@@ -108,3 +108,43 @@ def test_default_output_is_latency_and_optional_single_throughput():
     assert "128 GB/s" in table([row])
     warm = {**row, "metadata": {"cache_policy": "warm"}}
     assert {r["change"] for r in compare([row], [warm])} == {"added", "removed"}
+
+
+def test_sample_timer_calibrates_sub_tick_repeat():
+    from intent_bench.implementations.native_sampling import sample_native_call, sample_timer
+
+    calls = []
+
+    class RepeatTimer:
+        supports_repeat = True
+
+        def run(self, repeat=1):
+            calls.append(repeat)
+            return 0.0 if repeat < 4 else 0.02
+
+    settings = SimpleNamespace(warmup=1, samples=3, cache="warm")
+    metadata = {}
+    samples = sample_timer(RepeatTimer(), settings, None, metadata=metadata)
+    assert calls == [1, 1, 2, 4, 4, 4]
+    assert samples == [0.02, 0.02, 0.02]
+    assert metadata["timer_repeat"] == 4
+
+    non_idempotent_calls = []
+    restores = []
+
+    class MutatingTimer:
+        supports_repeat = True
+
+        def run(self, repeat=1):
+            non_idempotent_calls.append(repeat)
+            return 0.01
+
+    samples = sample_timer(MutatingTimer(), settings, lambda: restores.append(1))
+    assert non_idempotent_calls == [1, 1, 1, 1]
+    assert len(restores) == 4
+    assert samples == [0.01, 0.01, 0.01]
+
+    native_meta = {}
+    native_samples = sample_native_call(lambda: 0.25, settings, lambda: None, metadata=native_meta)
+    assert native_samples == [0.25, 0.25, 0.25]
+    assert native_meta == {"cache_policy": "warm"}

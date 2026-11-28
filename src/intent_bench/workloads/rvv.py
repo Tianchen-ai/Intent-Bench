@@ -42,11 +42,31 @@ def build(name):
         if name=='q4_projection':args=(weights,activation.reshape(activation.shape[0],-1,256))
         else:args=(weights[0],activation.reshape(-1,292))
         return prepare(prefix+name,args,env)
+    def generated_v2(case, data, env):
+        from ..implementations.v2_program import bind
+        if name == 'gemm':
+            weights, activations = data
+            return bind('linear_f32', 'weft', (activations, weights), env, 'cpu')
+        if name == 'rms_norm':
+            return bind('rms_norm_f32', 'weft', (data[1], 1.0 / data[1].shape[-1], 1e-5), env, 'cpu')
+        if name == 'q8_quantize':
+            call = bind('q8_quantize', 'weft', (data[1].reshape(-1, 256),), env, 'cpu')
+            result = call.result
+            call.result = lambda: result().reshape(-1)
+            return call
+        weights, activation = data
+        if name == 'q4_projection':
+            return bind('q4_projection_batched', 'weft', (weights, activation.reshape(activation.shape[0], -1, 256)), env, 'cpu')
+        call = bind('q4_dot', 'weft', (weights, activation.reshape(-1, 292)), env, 'cpu')
+        result = call.result
+        call.result = lambda: result().reshape(1, -1)
+        return call
     def encode(case, data, env):
         from ..implementations.native_libraries import pack_q4
         return pack_q4(data,env,packed_activation=name=="q4_dot")
     return Workload("rvv/"+name,cases,inputs,{"ggml":Implementation("ggml",prepare),
-                    "intent:weft":Implementation("intent:weft",generated)},oracle=oracle,
+                    "intent:weft":Implementation("intent:weft",generated),
+                    "intent-v2:weft":Implementation("intent-v2:weft",generated_v2)},oracle=oracle,
                     atol=0 if name=="q8_quantize" else 2e-3,
                     rtol=0 if name=="q8_quantize" else 2e-3,family="rvv/"+name,
                     prepare_inputs=encode if name in {"q4_dot","q4_projection"} else None)

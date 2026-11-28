@@ -41,9 +41,13 @@ def _prepare(name, implementation, case, inputs, env):
         from ..implementations.gpu import prepare
         return prepare(name, implementation, x)
     if implementation.startswith("intent-v2:"):
-        from intentdsl.examples import softmax, softmax_f32
+        from intentdsl.examples import relu, relu_f32, softmax, softmax_f32
         from ..implementations.intent_v2 import prepare
-        return prepare(softmax_f32 if x.dtype == torch.float32 else softmax, (x,), env, backend=target)
+        if name == "softmax":
+            definition = softmax_f32 if x.dtype == torch.float32 else softmax
+        else:
+            definition = relu_f32 if x.dtype == torch.float32 else relu
+        return prepare(definition, (x,), env, backend=target)
     intent = intent_environment(env)
     if name == "softmax":
         from intent.examples.kernels.normalization.softmax import stable_softmax, stable_softmax_f16
@@ -66,11 +70,11 @@ def build(name="softmax"):
     impls = {}
     for impl in ("numpy", "torch", "triton", "cutile", "intent:triton", "intent:cutile", "intent:mojo"):
         impls[impl] = Implementation(impl, lambda case, args, env, impl=impl: _prepare(name, impl, case, args, env))
+    from ..implementations.cpu_rows import register
+    impls.update(register(name))
     if name == "softmax":
-        from ..implementations.cpu_rows import register
         from ..references.aten_rows import registrations
         impls.update(registrations(name))
-        impls.update(register(name))
         from ..implementations.mlu_rows import register as mlu_rows
         impls.update(mlu_rows(name))
         for key in ("intent-v2:triton","intent-v2:cutile"):

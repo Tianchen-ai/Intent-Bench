@@ -8,14 +8,23 @@ class Definition:
 
 
 def _seed(name, seed):
-    from intent.examples import PROGRAMS
-    from intent.examples.programs import inputs
+    try:
+        from intentdsl.programs import PROGRAMS, inputs
+    except ImportError:
+        from intent.examples import PROGRAMS
+        from intent.examples.programs import inputs
     inputs.seed([seed, list(PROGRAMS).index(name)])
 
 
-def inputs(name, seed):
-    from intent.examples import load_program
+def _load_program(name):
+    try:
+        from intentdsl.programs import load_program
+    except ImportError:
+        from intent.examples import load_program
+    return load_program(name)
 
+
+def inputs(name, seed):
     class Captured(Exception):
         def __init__(self, arguments):
             self.arguments = arguments
@@ -30,7 +39,7 @@ def inputs(name, seed):
 
     _seed(name, seed)
     try:
-        load_program(name)(Context())
+        _load_program(name)(Context())
     except Captured as captured:
         return {"seed": seed, "arguments": captured.arguments}
     raise ValueError("author program did not declare a complete call")
@@ -38,8 +47,10 @@ def inputs(name, seed):
 
 def invoke(name, values, context):
     """Replay author construction, binding captured inputs at its public call."""
-    from intent.examples import load_program
-    from intent.examples.programs.inputs import Array
+    try:
+        from intentdsl.programs.inputs import Array
+    except ImportError:
+        from intent.examples.programs.inputs import Array
     replacements = {}
 
     class Context:
@@ -73,7 +84,7 @@ def invoke(name, values, context):
 
     _seed(name, values["seed"])
     replay = Context()
-    result = load_program(name)(replay)
+    result = _load_program(name)(replay)
     if not replay.called:
         raise ValueError("author program did not declare a complete call")
     return returned(result)

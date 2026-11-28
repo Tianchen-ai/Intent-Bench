@@ -100,6 +100,12 @@ def validate_captured(request, root, participants):
     environment = request.environment
     if environment.cpus is not None:
         cpus = set(environment.cpus)
+        if cpus and not cpus.issubset(os.sched_getaffinity(0)):
+            try:
+                from weft_core.cpu import bind_cpus
+                bind_cpus(sorted(cpus))
+            except Exception:
+                pass
         if not cpus or not cpus.issubset(os.sched_getaffinity(0)):
             raise ValueError("oracle CPUs must be a nonempty subset of the worker's allowed CPUs")
         os.sched_setaffinity(0, cpus)

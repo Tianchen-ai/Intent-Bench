@@ -19,9 +19,10 @@ def prepare(definition, args, env, backend="triton"):
     metadata={"candidate":target.get("candidate"),"operator_entry":"prepared_launch"}
     def compile():
         call.compile()
-        if backend=="cutile":metadata["cold_compile"]=call.compilation_report()
+        metadata["cold_compile"] = call.compilation_report()
     def result():
-        if backend=="cutile":metadata["cold_compile"].update(call.compilation_report())
+        if backend=="cutile" and "cold_compile" in metadata:
+            metadata["cold_compile"].update(call.compilation_report())
         return call.result()
     return PreparedCall(
         getattr(call, "execute", call.launch),

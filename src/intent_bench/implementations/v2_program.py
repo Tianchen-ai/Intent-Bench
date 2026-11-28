@@ -38,7 +38,10 @@ def prepare(name, backend, case, values, env):
         return call
     args=author_arguments(values,device)
     if name=="moe_alignment":
-        from intent.examples.kernels.routing.moe_align import EXPERT_BLOCKS, BLOCK_SIZE
+        try:
+            from intentdsl.programs import EXPERT_BLOCKS, BLOCK_SIZE
+        except ImportError:
+            from intent.examples.kernels.routing.moe_align import EXPERT_BLOCKS, BLOCK_SIZE
         # This public entry accepts the expert-block destination. Seed its
         # inactive tail before measurement, just like a caller reusing a buffer.
         if device=="cpu":
@@ -66,7 +69,10 @@ def prepare(name, backend, case, values, env):
 
 
 def author_arguments(values, device):
-    from intent.examples.programs.inputs import Array
+    try:
+        from intentdsl.programs.inputs import Array
+    except ImportError:
+        from intent.examples.programs.inputs import Array
     if device == "cpu":
         args = [x.to_numpy() if isinstance(x, Array) else x for x in values["arguments"]]
     else:
@@ -159,7 +165,7 @@ def bind(name, backend, args, env, device):
             nonlocal timer
             if timer is None:
                 timer = NativeSequence((call,))
-            return sample_timer(timer, settings, reset, metadata=metadata)
+            return sample_timer(timer, settings, reset if original else None, metadata=metadata)
         prepared.native_measure = measure
         prepared.close = lambda: timer and timer.close()
         prepared.timing = "cpu_native_monotonic"

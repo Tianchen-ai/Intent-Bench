@@ -48,23 +48,54 @@ def registrations():
     }
 
 
-def _bf16_tensor(rng, shape, scale=1.0):
+def _has_torch() -> bool:
+    from importlib.util import find_spec
+
+    return find_spec("torch") is not None
+
+
+def _wrap_array(arr: np.ndarray):
+    arr = np.ascontiguousarray(arr)
+    if _has_torch():
+        import torch
+
+        return torch.from_numpy(arr)
+    return arr
+
+
+def _to_torch_data(data):
     import torch
 
-    arr = (rng.standard_normal(shape, dtype=np.float32) * scale)
-    return torch.from_numpy(arr).to(torch.bfloat16)
+    def conv(x):
+        if not isinstance(x, np.ndarray):
+            return x
+        c = np.ascontiguousarray(x)
+        if c.dtype.name == "bfloat16":
+            return torch.from_numpy(c.view(np.uint16)).view(torch.bfloat16).clone()
+        return torch.from_numpy(c)
+
+    return tuple(conv(v) for v in data)
+
+
+def _bf16_tensor(rng, shape, scale=1.0, bias=0.0):
+    arr = rng.standard_normal(shape, dtype=np.float32) * scale
+    if _has_torch():
+        import torch
+
+        t = torch.from_numpy(arr).to(torch.bfloat16)
+        return t + bias if bias else t
+    import ml_dtypes
+
+    out = np.ascontiguousarray(arr.astype(ml_dtypes.bfloat16))
+    return np.ascontiguousarray(out + ml_dtypes.bfloat16(bias)) if bias else out
 
 
 def _f16_tensor(rng, shape, scale=1.0):
-    import torch
-
     arr = (rng.standard_normal(shape, dtype=np.float32) * scale).astype(np.float16)
-    return torch.from_numpy(arr)
+    return _wrap_array(arr)
 
 
 def _resolve_device(env, impl):
-    import torch
-
     if impl in {"aten:cpu", "intent-v2:mojo", "intent-v2:weft"}:
         if env.device not in {"auto", "cpu"}:
             raise EnvironmentUnavailable(f"{impl} requires a CPU environment")
@@ -80,11 +111,17 @@ def _resolve_device(env, impl):
             raise EnvironmentUnavailable(f"{impl} requires a CUDA environment")
         return device
     if env.device == "auto":
+        import torch
+
         return "cuda:0" if torch.cuda.is_available() else "cpu"
     return env.device
 
 
 def _transfer(args, device):
+    if device == "cpu" and not _has_torch():
+        return tuple(
+            np.ascontiguousarray(x) if isinstance(x, np.ndarray) else x for x in args
+        )
     import torch
 
     if device.startswith("mlu:"):
@@ -128,13 +165,12 @@ def _prepare_v2(name, backend, args, env, device):
         from ..implementations.native_sequence import NativeSequence
 
         timer = None
-        noop = lambda: None
 
         def measure(settings):
             nonlocal timer
             if timer is None:
                 timer = NativeSequence((call,))
-            return sample_timer(timer, settings, noop, metadata=metadata)
+            return sample_timer(timer, settings, None, metadata=metadata)
 
         prepared.native_measure = measure
         prepared.close = lambda: timer and timer.close()
@@ -153,8 +189,6 @@ def _prepare_v2(name, backend, args, env, device):
 
 
 def _inputs(name, case, seed):
-    import torch
-
     p = case.parameters
     rng = np.random.default_rng(seed)
     if name == "sliding_window_attention":
@@ -188,28 +222,28 @@ def _inputs(name, case, seed):
             _bf16_tensor(rng, (b, hq, s, d), 0.5),
             _bf16_tensor(rng, (b, hk, s, d), 0.5),
             _bf16_tensor(rng, (b, hk, s, d), 0.5),
-            torch.from_numpy(slopes),
+            _wrap_array(slopes),
             1.0 / math.sqrt(d),
         )
     if name == "cross_entropy":
         m, v = p["rows"], p["vocab"]
         logits = _bf16_tensor(rng, (m, v), 1.0)
-        targets = torch.from_numpy(rng.integers(0, v, size=(m,), dtype=np.int32))
-        grad_loss = torch.from_numpy(rng.uniform(0.1, 1.5, size=(m,)).astype(np.float32))
+        targets = _wrap_array(rng.integers(0, v, size=(m,), dtype=np.int32))
+        grad_loss = _wrap_array(rng.uniform(0.1, 1.5, size=(m,)).astype(np.float32))
         return (logits, targets, grad_loss)
     if name == "topk_rows":
         m, v = p["rows"], p["cols"]
         base = rng.standard_normal((m, v), dtype=np.float32)
         # Ensure distinct values so tie-breaking never masks genuine selection bugs.
         jitter = (np.arange(v, dtype=np.float32)[None, :] * 1e-6)
-        return (torch.from_numpy((base + jitter).astype(np.float32)),)
+        return (_wrap_array((base + jitter).astype(np.float32)),)
     if name == "qk_norm_rope":
         b, s = p["batch"], p["seq"]
         return (
             _bf16_tensor(rng, (b, 32, s, 128), 1.0),
             _bf16_tensor(rng, (b, 8, s, 128), 1.0),
-            _bf16_tensor(rng, (128,), 0.5) + 1.0,
-            _bf16_tensor(rng, (128,), 0.5) + 1.0,
+            _bf16_tensor(rng, (128,), 0.5, bias=1.0),
+            _bf16_tensor(rng, (128,), 0.5, bias=1.0),
             _bf16_tensor(rng, (s, 64), 0.5),
             _bf16_tensor(rng, (s, 64), 0.5),
             1.0 / 128.0,
@@ -234,6 +268,8 @@ def _inputs(name, case, seed):
 
 def _oracle(name, case, data):
     import torch
+
+    data = _to_torch_data(data)
 
     if name == "sliding_window_attention":
         q, k, v, scale, window = data

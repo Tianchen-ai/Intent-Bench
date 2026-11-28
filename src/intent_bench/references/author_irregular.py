@@ -17,7 +17,10 @@ def prepare(name, implementation, arguments, environment):
             return values.new_zeros(rows.numel()).index_add_(0, indices, values * vector[columns.long()])
         library = "ATen CSR gather and segmented sum"
     elif implementation == "aten:source" and name == "moe_alignment":
-        from intent.examples.kernels.routing.moe_align import BLOCK_SIZE, EXPERTS
+        try:
+            from intentdsl.programs import BLOCK_SIZE, EXPERTS
+        except ImportError:
+            from intent.examples.kernels.routing.moe_align import BLOCK_SIZE, EXPERTS
         run = lambda: cpu_runtime.moe_align_block_size(arguments[0], BLOCK_SIZE, EXPERTS)
         library = "ATen stable route ordering and block padding"
     elif implementation == "aten:source" and name == "ragged_gemm":
@@ -45,7 +48,10 @@ def prepare(name, implementation, arguments, environment):
         elif name == "causal_convolution":
             run = lambda: cpu_runtime.causal_conv1d(*arguments)
         elif name == "moe_alignment":
-            from intent.examples.kernels.routing.moe_align import BLOCK_SIZE, EXPERTS
+            try:
+                from intentdsl.programs import BLOCK_SIZE, EXPERTS
+            except ImportError:
+                from intent.examples.kernels.routing.moe_align import BLOCK_SIZE, EXPERTS
             run = lambda: tuple(value.to(device) for value in
                 cpu_runtime.moe_align_block_size(arguments[0].cpu(), BLOCK_SIZE, EXPERTS))
         elif name == "nonzero":
@@ -147,7 +153,10 @@ def prepare(name, implementation, arguments, environment):
         note = ("Source requires channel-last storage and FP32 operands to preserve the author's FP32 products; "
                 "widening, layout conversion and final FP16 materialization are included.")
     elif name == "moe_alignment" and implementation == "cutile":
-        from intent.examples.kernels.routing.moe_align import BLOCK_SIZE, EXPERTS
+        try:
+            from intentdsl.programs import BLOCK_SIZE, EXPERTS
+        except ImportError:
+            from intent.examples.kernels.routing.moe_align import BLOCK_SIZE, EXPERTS
         from ..implementations.context import Context
         from ..source_support import runtime_module
         context = Context(environment.compiler, PROJECT_ROOT, None, "cutile", environment=environment)

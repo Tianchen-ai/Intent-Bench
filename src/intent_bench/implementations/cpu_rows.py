@@ -26,19 +26,22 @@ def prepare(name, impl, case, args, env):
     is_soft = name == "softmax"
     if impl.startswith("intent-v2:"):
         import intentdsl
-        from intentdsl.examples import softmax, softmax_f32, rms_norm
+        from intentdsl.examples import relu, relu_f32, rms_norm, softmax, softmax_f32
         from .native_sequence import NativeSequence
         from .native_sampling import sample_timer
 
         backend = impl.split(":")[1]
         target = env.options.get("compilerinfra", {})
         math_kwargs = {k: target[k] for k in ("fpmath_mode", "fast_math", "denormal_fp_math", "numerics") if k in target}
+        definition = (
+            (softmax_f32 if args[0].dtype == np.float32 else softmax)
+            if is_soft
+            else (relu_f32 if args[0].dtype == np.float32 else relu)
+            if name == "relu"
+            else rms_norm
+        )
         kernel = intentdsl.jit(
-            (
-                (softmax_f32 if args[0].dtype == np.float32 else softmax)
-                if is_soft
-                else rms_norm
-            ),
+            definition,
             backend=backend,
             library=target.get("library"),
             configuration=target.get("configuration"),
@@ -59,7 +62,7 @@ def prepare(name, impl, case, args, env):
             nonlocal timer
             if timer is None:
                 timer = NativeSequence((call,))
-            return sample_timer(timer, settings, lambda: None, metadata=metadata)
+            return sample_timer(timer, settings, None, metadata=metadata)
 
         return PreparedCall(
             getattr(call, "execute", call.launch),
@@ -82,6 +85,11 @@ def prepare(name, impl, case, args, env):
             )
         )
         if is_soft
+        else (
+            "activation.pointwise:"
+            + ("relu_forward_f32" if args[0].dtype == np.float32 else "relu_forward")
+        )
+        if name == "relu"
         else "normalization.rms_norm:weighted_rms_norm"
     )
     ref = "intent.examples.kernels." + symbol

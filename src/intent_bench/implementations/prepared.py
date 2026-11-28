@@ -104,7 +104,7 @@ def intent_sequence(call, result, *, reset=None, host_run=None, host_result=None
     if isinstance(call, (tuple, list)):
         call = PreparedSequence(call, outputs=None)
     native = {}
-    restore = reset or (lambda: None)
+    restore = reset
     call_metadata = {**(metadata or {}), 'operator_entry': 'prepared_native_sequence',
                      'kernel_count': call.kernel_count if isinstance(call, PreparedSequence) else 1,
                      'initialization_count': call.initialization_count if isinstance(call, PreparedSequence) else 0}
@@ -114,8 +114,7 @@ def intent_sequence(call, result, *, reset=None, host_run=None, host_result=None
             from .native_sequence import NativeSequence
             native['timer'] = NativeSequence((call,))
         from .native_sampling import sample_timer
-        call_metadata['cache_policy'] = 'flush_cpu_64m' if settings.cache == 'flush' else 'warm'
-        return sample_timer(native['timer'], settings, restore)
+        return sample_timer(native['timer'], settings, restore, metadata=call_metadata)
 
     def close():
         if native:
@@ -143,20 +142,21 @@ def attach_device_timer(prepared):
         from ..implementations.native_sampling import sample_timer
 
         class _HostTimer:
+            supports_repeat = True
+
             def __init__(self, fn):
                 self._fn = fn
+                self._calibrated_repeat = None
 
-            def run(self):
+            def run(self, repeat=1):
                 t0 = time.perf_counter()
-                self._fn()
-                return (time.perf_counter() - t0) * 1000.0
+                for _ in range(repeat):
+                    self._fn()
+                return (time.perf_counter() - t0) * 1000.0 / repeat
 
         timer = _HostTimer(prepared.launch)
-        def restore():
-            if prepared.reset is not None:
-                prepared.reset()
         prepared.native_measure = lambda settings: sample_timer(
-            timer, settings, restore, metadata=prepared.metadata
+            timer, settings, prepared.reset, metadata=prepared.metadata
         )
         prepared.timing = "cpu_monotonic"
     elif prepared.device.startswith("mlu:"):

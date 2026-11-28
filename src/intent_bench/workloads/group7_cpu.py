@@ -50,16 +50,47 @@ def registrations():
     }
 
 
-def _bf16_tensor(rng, shape, scale=1.0):
+def _has_torch() -> bool:
+    from importlib.util import find_spec
+
+    return find_spec("torch") is not None
+
+
+def _wrap_array(arr: np.ndarray):
+    arr = np.ascontiguousarray(arr)
+    if _has_torch():
+        import torch
+
+        return torch.from_numpy(arr)
+    return arr
+
+
+def _to_torch_data(data):
     import torch
 
+    def conv(x):
+        if not isinstance(x, np.ndarray):
+            return x
+        c = np.ascontiguousarray(x)
+        if c.dtype.name == "bfloat16":
+            return torch.from_numpy(c.view(np.uint16)).view(torch.bfloat16).clone()
+        return torch.from_numpy(c)
+
+    return tuple(conv(v) for v in data)
+
+
+def _bf16_tensor(rng, shape, scale=1.0):
     arr = rng.standard_normal(shape, dtype=np.float32) * scale
-    return torch.from_numpy(arr).to(torch.bfloat16)
+    if _has_torch():
+        import torch
+
+        return torch.from_numpy(arr).to(torch.bfloat16)
+    import ml_dtypes
+
+    return np.ascontiguousarray(arr.astype(ml_dtypes.bfloat16))
 
 
 def _resolve_device(env, impl):
-    import torch
-
     if impl in {"aten:cpu", "ggml", "intent-v2:mojo", "intent-v2:weft"}:
         if env.device not in {"auto", "cpu"}:
             raise EnvironmentUnavailable(f"{impl} requires a CPU environment")
@@ -75,6 +106,8 @@ def _resolve_device(env, impl):
             raise EnvironmentUnavailable(f"{impl} requires a CUDA environment")
         return device
     if env.device == "auto":
+        import torch
+
         return "cuda:0" if torch.cuda.is_available() else "cpu"
     if impl == "inductor" and env.device.startswith("mlu:"):
         raise EnvironmentUnavailable("inductor requires a CPU or CUDA environment")
@@ -82,6 +115,10 @@ def _resolve_device(env, impl):
 
 
 def _transfer(args, device):
+    if device == "cpu" and not _has_torch():
+        return tuple(
+            np.ascontiguousarray(x) if isinstance(x, np.ndarray) else x for x in args
+        )
     import torch
 
     if device.startswith("mlu:"):
@@ -130,13 +167,12 @@ def _prepare_v2(name, backend, args, env, device):
         from ..implementations.native_sequence import NativeSequence
 
         timer = None
-        noop = lambda: None
 
         def measure(settings):
             nonlocal timer
             if timer is None:
                 timer = NativeSequence((call,))
-            return sample_timer(timer, settings, noop, metadata=metadata)
+            return sample_timer(timer, settings, None, metadata=metadata)
 
         prepared.native_measure = measure
         prepared.close = lambda: timer and timer.close()
@@ -155,26 +191,24 @@ def _prepare_v2(name, backend, args, env, device):
 
 
 def _inputs(name, case, seed):
-    import torch
-
     p = case.parameters
     rng = np.random.default_rng(seed)
 
     if name == "embedding_bag":
         bags, vocab, dim, max_bag = p["bags"], p["vocab"], p["dim"], p["max_bag"]
-        table = torch.from_numpy(rng.standard_normal((vocab, dim), dtype=np.float32))
+        table = _wrap_array(rng.standard_normal((vocab, dim), dtype=np.float32))
         lengths = rng.integers(0, max_bag + 1, size=(bags,), dtype=np.int32)
         offsets = np.empty((bags + 1,), dtype=np.int32)
         offsets[0] = 0
         np.cumsum(lengths, dtype=np.int32, out=offsets[1:])
         total = int(offsets[-1])
-        indices = torch.from_numpy(rng.integers(0, vocab, size=(total,), dtype=np.int32))
-        return (table, indices, torch.from_numpy(offsets))
+        indices = _wrap_array(rng.integers(0, vocab, size=(total,), dtype=np.int32))
+        return (table, indices, _wrap_array(offsets))
 
     if name == "index_add":
         rows, updates, dim = p["rows"], p["updates"], p["dim"]
-        base = torch.from_numpy(rng.standard_normal((rows, dim), dtype=np.float32))
-        src = torch.from_numpy(rng.standard_normal((updates, dim), dtype=np.float32))
+        base = _wrap_array(rng.standard_normal((rows, dim), dtype=np.float32))
+        src = _wrap_array(rng.standard_normal((updates, dim), dtype=np.float32))
         # Mix uniform indices with a hot subset to exercise duplicate-index accumulation.
         hot = updates // 4
         idx_np = np.concatenate(
@@ -184,7 +218,7 @@ def _inputs(name, case, seed):
             )
         )
         rng.shuffle(idx_np)
-        return (base, torch.from_numpy(idx_np), src)
+        return (base, _wrap_array(idx_np), src)
 
     if name == "triangular_solve":
         b, n, k = p["batch"], p["n"], p["rhs"]
@@ -194,16 +228,16 @@ def _inputs(name, case, seed):
         idx = np.arange(n)
         l_np[:, idx, idx] = diag
         rhs = rng.standard_normal((b, n, k), dtype=np.float32)
-        return (torch.from_numpy(l_np), torch.from_numpy(rhs))
+        return (_wrap_array(l_np), _wrap_array(rhs))
 
     if name == "log_softmax_kl":
         m, v = p["rows"], p["vocab"]
-        logits = torch.from_numpy(rng.standard_normal((m, v), dtype=np.float32))
+        logits = _wrap_array(rng.standard_normal((m, v), dtype=np.float32))
         scores = rng.standard_normal((m, v), dtype=np.float32) * 0.8
         scores -= scores.max(axis=-1, keepdims=True)
         probs = np.exp(scores)
         probs /= probs.sum(axis=-1, keepdims=True)
-        return (logits, torch.from_numpy(probs.astype(np.float32)))
+        return (logits, _wrap_array(probs.astype(np.float32)))
 
     if name == "retention_recurrence":
         b, t, h, d = p["batch"], p["seq"], p["heads"], p["head_dim"]
@@ -214,27 +248,27 @@ def _inputs(name, case, seed):
             _bf16_tensor(rng, (b, t, h, d), 0.5),
             _bf16_tensor(rng, (b, t, h, d), 0.5),
             _bf16_tensor(rng, (b, t, h, d), 0.5),
-            torch.from_numpy(gamma),
+            _wrap_array(gamma),
             1.0 / math.sqrt(d),
         )
 
     if name == "radix_pass":
         rows, cols, divisor = p["rows"], p["cols"], p["divisor"]
-        keys = torch.from_numpy(
+        keys = _wrap_array(
             rng.integers(0, 1 << 24, size=(rows, cols), dtype=np.int32)
         )
         # Distinct values per row verify strict stability of the radix pass.
         vals_np = np.broadcast_to(
             np.arange(cols, dtype=np.int32)[None, :], (rows, cols)
         ).copy()
-        return (keys, torch.from_numpy(vals_np), int(divisor))
+        return (keys, _wrap_array(vals_np), int(divisor))
 
     if name == "layer_norm_welford":
         r, c, eps = p["rows"], p["cols"], p["eps"]
         return (
-            torch.from_numpy(rng.standard_normal((r, c), dtype=np.float32)),
-            torch.from_numpy(rng.standard_normal((c,), dtype=np.float32) * 0.5 + 1.0),
-            torch.from_numpy(rng.standard_normal((c,), dtype=np.float32) * 0.1),
+            _wrap_array(rng.standard_normal((r, c), dtype=np.float32)),
+            _wrap_array(rng.standard_normal((c,), dtype=np.float32) * 0.5 + 1.0),
+            _wrap_array(rng.standard_normal((c,), dtype=np.float32) * 0.1),
             float(eps),
         )
 
@@ -243,6 +277,8 @@ def _inputs(name, case, seed):
 
 def _oracle(name, case, data):
     import torch
+
+    data = _to_torch_data(data)
 
     if name == "embedding_bag":
         table, indices, offsets = data
@@ -335,9 +371,6 @@ def _oracle(name, case, data):
 
 
 def _prepare_baseline(name, impl, case, data, env, device):
-    import torch
-    import torch.nn.functional as F
-
     if impl == "ggml" and name == "layer_norm_welford":
         from ..implementations.native_libraries import ggml
 
@@ -346,14 +379,17 @@ def _prepare_baseline(name, impl, case, data, env, device):
             "layer_norm",
             None,
             (
-                x.numpy(),
-                gain.numpy(),
-                offset.numpy(),
+                x if isinstance(x, np.ndarray) else x.numpy(),
+                gain if isinstance(gain, np.ndarray) else gain.numpy(),
+                offset if isinstance(offset, np.ndarray) else offset.numpy(),
                 1.0 / x.shape[-1],
                 float(eps),
             ),
             env,
         )
+
+    import torch
+    import torch.nn.functional as F
 
     args = _transfer(data, device)
     state: dict[str, object] = {}
